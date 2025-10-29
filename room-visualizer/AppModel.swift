@@ -18,4 +18,6 @@ class AppModel {
         case open
     }
     var immersiveSpaceState = ImmersiveSpaceState.closed
+    var selectedModel: String = "starry_night"
+    var isLoadingModel: Bool = false
 }

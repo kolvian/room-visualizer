@@ -24,6 +24,8 @@ struct ImmersiveView: View {
     @State private var styleTransferModel: MLModel?
     @State private var videoPassthrough: VideoPassthroughSimulator?
     @State private var videoDisplayEntity: ModelEntity?
+    @State private var isInitialized = false
+    @State private var isSwitchingModel = false
 
     // Detect if running in simulator
     private var isSimulator: Bool {
@@ -49,6 +51,10 @@ struct ImmersiveView: View {
                 await startARSession()
             }
 
+            await MainActor.run {
+                isInitialized = true
+            }
+
         } update: { content in
             // Update loop for dynamic content
         }
@@ -59,6 +65,15 @@ struct ImmersiveView: View {
         }
         .onDisappear {
             videoPassthrough?.stop()
+            videoPassthrough?.clearCache()
+            isInitialized = false
+        }
+        .onChange(of: appModel.selectedModel) { oldValue, newValue in
+            // Only switch if initialized and not already switching
+            guard isInitialized, !isSwitchingModel else { return }
+            Task {
+                await switchModel(to: newValue)
+            }
         }
     }
     
@@ -122,30 +137,41 @@ struct ImmersiveView: View {
     }
     
     private func loadStyleTransferModel() async {
+        await MainActor.run {
+            appModel.isLoadingModel = true
+        }
+
         do {
-            guard let modelURL = Bundle.main.url(forResource: "starry_night", withExtension: "mlpackage") ??
-                                 Bundle.main.url(forResource: "starry_night", withExtension: "mlmodelc") else {
-                print("⚠️ Model 'starry_night' not found in bundle")
+            guard let modelURL = Bundle.main.url(forResource: appModel.selectedModel, withExtension: "mlpackage") ??
+                                 Bundle.main.url(forResource: appModel.selectedModel, withExtension: "mlmodelc") else {
+                print("⚠️ Model '\(appModel.selectedModel)' not found in bundle")
+                await MainActor.run {
+                    appModel.isLoadingModel = false
+                }
                 return
             }
 
             let config = MLModelConfiguration()
-            // Use CPU and GPU on simulator, all units on device
             #if targetEnvironment(simulator)
-            config.computeUnits = .cpuAndGPU
+            config.computeUnits = .cpuOnly
             #else
             config.computeUnits = .all
+            config.allowLowPrecisionAccumulationOnGPU = true
             #endif
             let model = try MLModel(contentsOf: modelURL, configuration: config)
 
-            print("✅ Style transfer model loaded successfully")
+            print("✅ Style transfer model '\(appModel.selectedModel)' loaded successfully")
 
             await MainActor.run {
                 self.styleTransferModel = model
+                appModel.isLoadingModel = false
             }
 
         } catch {
             print("⚠️ Failed to load style transfer model: \(error)")
+            await MainActor.run {
+                appModel.isLoadingModel = false
+            }
         }
     }
     
@@ -154,6 +180,8 @@ struct ImmersiveView: View {
             print("⚠️ Cannot setup video passthrough: model not loaded")
             return
         }
+
+        print("🎥 Setting up video passthrough with model: \(appModel.selectedModel)")
 
         // Try to load video from bundle
         // Note: You need to add a video file to your bundle (e.g., "test-room.mp4")
@@ -171,14 +199,18 @@ struct ImmersiveView: View {
             return
         }
 
-        videoPassthrough = simulator
+        await MainActor.run {
+            videoPassthrough = simulator
+        }
 
         // Create a full-screen quad to display the video
         await createVideoDisplayQuad()
 
         // Set up frame callback (capture videoDisplayEntity to avoid reference cycles)
         let displayEntity = videoDisplayEntity
-        simulator.onFrameAvailable = { styledBuffer in
+        simulator.onFrameAvailable = { [weak simulator] styledBuffer in
+            // Check if simulator is still valid
+            guard simulator != nil else { return }
             Task { @MainActor in
                 guard let entity = displayEntity else { return }
                 await updateVideoTexture(for: entity, with: styledBuffer)
@@ -186,7 +218,13 @@ struct ImmersiveView: View {
         }
 
         // Start playback
-        simulator.start()
+        do {
+            simulator.start()
+            print("✅ Video passthrough started successfully")
+        } catch {
+            print("⚠️ Failed to start video passthrough: \(error)")
+            await createDemoPlanes()
+        }
     }
 
     @MainActor
@@ -261,6 +299,70 @@ struct ImmersiveView: View {
         }
     }
     
+    private func switchModel(to modelName: String) async {
+        guard !isSwitchingModel else {
+            print("⚠️ Already switching model, ignoring request")
+            return
+        }
+
+        await MainActor.run {
+            isSwitchingModel = true
+        }
+
+        defer {
+            Task { @MainActor in
+                isSwitchingModel = false
+            }
+        }
+
+        print("🔄 Switching to model: \(modelName)")
+
+        // Stop current video passthrough if running
+        await MainActor.run {
+            videoPassthrough?.stop()
+            videoPassthrough?.clearCache()
+            videoPassthrough = nil
+        }
+
+        // Clear existing entities
+        await MainActor.run {
+            for (_, entity) in planeEntities {
+                entity.removeFromParent()
+            }
+            planeEntities.removeAll()
+
+            if let videoEntity = videoDisplayEntity {
+                videoEntity.removeFromParent()
+                videoDisplayEntity = nil
+            }
+
+            styleTransferModel = nil
+        }
+
+        // Small delay to ensure cleanup completes
+        try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+
+        // Reload model with new selection
+        await loadStyleTransferModel()
+
+        // Only restart visualization if model loaded successfully
+        guard styleTransferModel != nil else {
+            print("⚠️ Model failed to load, not restarting visualization")
+            await MainActor.run {
+                appModel.isLoadingModel = false
+            }
+            return
+        }
+
+        // Restart visualization
+        if isSimulator {
+            await setupVideoPassthrough()
+        }
+        // Note: AR session continues running for real device, planes will update with new model
+
+        print("✅ Model switch complete")
+    }
+
     private func applyStyleTransfer(model: MLModel, planeSize: (width: Float, height: Float)) async -> MaterialParameters.Texture? {
         let size = CGSize(width: 256, height: 256)
         let renderer = UIGraphicsImageRenderer(size: size)

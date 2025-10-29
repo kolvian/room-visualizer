@@ -16,7 +16,7 @@
             endingColumnNumber = "9223372036854775807"
             startingLineNumber = "317"
             endingLineNumber = "317"
-            landmarkName = "convertPixelBufferToMultiArray(_:multiArray:width:height:)"
+            landmarkName = "applyStyleTransfer(to:)"
             landmarkType = "7">
          </BreakpointContent>
       </BreakpointProxy>

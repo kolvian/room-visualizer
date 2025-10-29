@@ -16,6 +16,7 @@ import StyleTransferEngine
 struct DemoStyleBenchmarkView: View {
     @State private var fps: Double = 0
     @State private var running = false
+    @State private var selectedModel: String = "starry_night"
 
     // 720p target for MVP
     private let width: Int32 = 1280
@@ -23,7 +24,6 @@ struct DemoStyleBenchmarkView: View {
 
     #if canImport(StyleTransferEngine)
     @State private var engine: StyleTransferEngine? = nil
-    private let adapter = NoOpAdapter()
     #endif
 
     @State private var timer: DispatchSourceTimer?
@@ -34,6 +34,24 @@ struct DemoStyleBenchmarkView: View {
                 .font(.title2)
             Text(String(format: "FPS: %.1f", fps))
                 .font(.headline)
+
+            // Model selection buttons
+            HStack(spacing: 12) {
+                Button("Starry Night") {
+                    selectedModel = "starry_night"
+                    reset()
+                }
+                .buttonStyle(.bordered)
+                .tint(selectedModel == "starry_night" ? .blue : .gray)
+
+                Button("Rain Princess") {
+                    selectedModel = "rain_princess"
+                    reset()
+                }
+                .buttonStyle(.bordered)
+                .tint(selectedModel == "rain_princess" ? .blue : .gray)
+            }
+
             HStack {
                 Button(running ? "Stop" : "Start") { toggleRun() }
                     .buttonStyle(.borderedProminent)
@@ -43,7 +61,10 @@ struct DemoStyleBenchmarkView: View {
             .padding(.top, 8)
 
             #if canImport(StyleTransferEngine)
-            Text("Engine: StyleTransferEngine + NoOpAdapter")
+            Text("Engine: StyleTransferEngine + CoreMLStyleAdapter")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Text("Model: \(selectedModel)")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             #else
@@ -63,9 +84,14 @@ struct DemoStyleBenchmarkView: View {
         #if canImport(StyleTransferEngine)
         if engine == nil {
             let cfg = InferenceConfig(targetSize: CGSize(width: Int(width), height: Int(height)))
-            engine = StyleTransferEngine(style: StyleDescriptor(id: "noop", displayName: "NoOp"), config: cfg)
-            // NoOp ignores the URL; pass a dummy URL.
-            try? engine?.loadModel(at: URL(fileURLWithPath: "/dev/null"), adapter: adapter)
+            let displayName = selectedModel == "starry_night" ? "Starry Night" : "Rain Princess"
+            engine = StyleTransferEngine(style: StyleDescriptor(id: selectedModel, displayName: displayName), config: cfg)
+
+            // Load the CoreML model from the bundle
+            if let adapter = try? CoreMLStyleAdapter.fromBundle(modelName: selectedModel) {
+                // The adapter already has the model URL loaded
+                try? engine?.loadModel(at: URL(fileURLWithPath: "/dev/null"), adapter: adapter)
+            }
         }
         #endif
     }

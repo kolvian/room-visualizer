@@ -18,9 +18,8 @@ class CoreMLStyleAdapter: StyleModelAdapter {
     private var modelURL: URL?
     private var isLoading = false
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
-    
-    // TODO: Update this to match your exported model name (without .mlmodelc extension)
-    private let modelName = "starry_night" // Change to match your style name
+
+    init() {}
     
     func load(modelURL: URL) throws {
         self.modelURL = modelURL
@@ -57,13 +56,12 @@ class CoreMLStyleAdapter: StyleModelAdapter {
         }
 
         let config = MLModelConfiguration()
-        // Use CPU and GPU on simulator, all units on device
         #if targetEnvironment(simulator)
-        config.computeUnits = .cpuAndGPU
+        config.computeUnits = .cpuOnly
         #else
         config.computeUnits = .all
-        #endif
         config.allowLowPrecisionAccumulationOnGPU = true
+        #endif
 
         do {
             model = try MLModel(contentsOf: compiledURL, configuration: config)

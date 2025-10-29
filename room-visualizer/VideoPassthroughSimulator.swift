@@ -37,6 +37,21 @@ final class VideoPassthroughSimulator: NSObject {
     /// Callback invoked when a new styled frame is available
     var onFrameAvailable: ((CVPixelBuffer) -> Void)?
 
+    // Cached model metadata for performance
+    private let inputName: String
+    private let outputName: String
+    private let expectedWidth: Int
+    private let expectedHeight: Int
+    private let outputDataType: MLMultiArrayDataType
+
+    // Reusable buffers for performance
+    private var cachedInputArray: MLMultiArray?
+    private var cachedInputBuffer: MTLBuffer?
+    private var cachedOutputBuffer: MTLBuffer?
+
+    // Frame processing control
+    private var isProcessingFrame = false
+
     // MARK: - Initialization
 
     /// Initialize with a video URL and CoreML model
@@ -103,6 +118,66 @@ final class VideoPassthroughSimulator: NSObject {
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
         self.textureCache = cache
 
+        // Cache model metadata for performance
+        guard let inputName = model.modelDescription.inputDescriptionsByName.keys.first else {
+            print("⚠️ No input features found in model")
+            return nil
+        }
+
+        guard let inputDesc = model.modelDescription.inputDescriptionsByName[inputName] else {
+            print("⚠️ Failed to get input description for '\(inputName)'")
+            return nil
+        }
+
+        guard let multiArrayConstraint = inputDesc.multiArrayConstraint else {
+            print("⚠️ Input is not a multiArray type (got: \(inputDesc.type))")
+            return nil
+        }
+
+        guard let outputName = model.modelDescription.outputDescriptionsByName.keys.first else {
+            print("⚠️ No output features found in model")
+            return nil
+        }
+
+        guard let outputDesc = model.modelDescription.outputDescriptionsByName[outputName] else {
+            print("⚠️ Failed to get output description for '\(outputName)'")
+            return nil
+        }
+
+        guard let outputConstraint = outputDesc.multiArrayConstraint else {
+            print("⚠️ Output is not a multiArray type (got: \(outputDesc.type))")
+            return nil
+        }
+
+        self.inputName = inputName
+        self.outputName = outputName
+        self.outputDataType = outputConstraint.dataType
+
+        // Extract expected dimensions from model shape
+        let modelShape = multiArrayConstraint.shape.map { $0.intValue }
+        if modelShape.count == 4 {
+            if modelShape[1] == 3 {
+                // [1, 3, H, W] - channels first
+                self.expectedHeight = modelShape[2]
+                self.expectedWidth = modelShape[3]
+            } else {
+                // [1, H, W, 3] - channels last
+                self.expectedHeight = modelShape[1]
+                self.expectedWidth = modelShape[2]
+            }
+        } else if modelShape.count == 3 {
+            if modelShape[0] == 3 {
+                self.expectedHeight = modelShape[1]
+                self.expectedWidth = modelShape[2]
+            } else {
+                self.expectedHeight = modelShape[0]
+                self.expectedWidth = modelShape[1]
+            }
+        } else {
+            print("⚠️ Unsupported model shape: \(modelShape)")
+            return nil
+        }
+
         super.init()
 
         // Add video output to player item
@@ -136,6 +211,14 @@ final class VideoPassthroughSimulator: NSObject {
     func stop() {
         player.pause()
         stopDisplayLink()
+        isProcessingFrame = false
+    }
+
+    /// Clear cached buffers (call when switching models or dimensions change)
+    func clearCache() {
+        cachedInputArray = nil
+        cachedInputBuffer = nil
+        cachedOutputBuffer = nil
     }
 
     // MARK: - Private Methods
@@ -144,8 +227,12 @@ final class VideoPassthroughSimulator: NSObject {
         guard displayLink == nil else { return }
 
         let link = CADisplayLink(target: self, selector: #selector(processFrame))
-        // Target 15-20 FPS for better performance with style transfer
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 20, preferred: 20)
+        // Target 10-15 FPS on simulator (CPU-only), higher on device
+        #if targetEnvironment(simulator)
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 8, maximum: 15, preferred: 12)
+        #else
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 20, maximum: 30, preferred: 30)
+        #endif
         link.add(to: .main, forMode: .common)
         displayLink = link
     }
@@ -155,11 +242,29 @@ final class VideoPassthroughSimulator: NSObject {
         displayLink = nil
     }
 
+    private var debugFrameCount = 0
+
     @objc private func processFrame() {
+        debugFrameCount += 1
+        if debugFrameCount == 1 {
+            print("🎬 processFrame called")
+        }
+
+        // Skip frame if still processing previous one
+        guard !isProcessingFrame else {
+            if debugFrameCount % 60 == 0 {
+                print("⏭️ Skipping frame - still processing")
+            }
+            return
+        }
+
         let currentTime = playerItem.currentTime()
 
         // Check if a new frame is available
         guard videoOutput.hasNewPixelBuffer(forItemTime: currentTime) else {
+            if debugFrameCount == 1 {
+                print("⚠️ No new pixel buffer available")
+            }
             return
         }
 
@@ -168,127 +273,112 @@ final class VideoPassthroughSimulator: NSObject {
             forItemTime: currentTime,
             itemTimeForDisplay: nil
         ) else {
+            if debugFrameCount == 1 {
+                print("⚠️ Failed to copy pixel buffer")
+            }
             return
         }
 
+        if debugFrameCount == 1 {
+            print("✅ Got pixel buffer, starting style transfer")
+        }
+
         // Apply style transfer
+        isProcessingFrame = true
         Task {
+            defer {
+                isProcessingFrame = false
+            }
+
             do {
                 let styledBuffer = try await applyStyleTransfer(to: pixelBuffer)
-                onFrameAvailable?(styledBuffer)
+
+                if debugFrameCount % 30 == 1 {
+                    print("✅ Frame processed successfully")
+                }
+
+                await MainActor.run {
+                    onFrameAvailable?(styledBuffer)
+                }
             } catch {
                 // Fallback: use original frame if style transfer fails
                 print("⚠️ Style transfer failed: \(error)")
-                onFrameAvailable?(pixelBuffer)
+                await MainActor.run {
+                    onFrameAvailable?(pixelBuffer)
+                }
             }
         }
     }
 
     private func applyStyleTransfer(to pixelBuffer: CVPixelBuffer) async throws -> CVPixelBuffer {
-        let originalWidth = CVPixelBufferGetWidth(pixelBuffer)
-        let originalHeight = CVPixelBufferGetHeight(pixelBuffer)
+        var inputWidth = CVPixelBufferGetWidth(pixelBuffer)
+        var inputHeight = CVPixelBufferGetHeight(pixelBuffer)
 
-        guard let inputName = styleModel.modelDescription.inputDescriptionsByName.keys.first else {
-            throw VideoPassthroughError.invalidModel
+        // On simulator, downscale large inputs for better performance
+        #if targetEnvironment(simulator)
+        let maxDimension = 360
+        if inputWidth > maxDimension || inputHeight > maxDimension {
+            let scale = min(CGFloat(maxDimension) / CGFloat(inputWidth), CGFloat(maxDimension) / CGFloat(inputHeight))
+            inputWidth = Int(CGFloat(inputWidth) * scale)
+            inputHeight = Int(CGFloat(inputHeight) * scale)
         }
+        #endif
 
-        // Get input description to check expected format
-        guard let inputDesc = styleModel.modelDescription.inputDescriptionsByName[inputName] else {
-            throw VideoPassthroughError.invalidModel
-        }
-
-        print("🔍 Model input type: \(inputDesc.type)")
-
-        let inputFeature: MLFeatureValue
-
-        // Check if model expects multiArray (tensor) or image input
-        if let multiArrayConstraint = inputDesc.multiArrayConstraint {
-            print("🔍 Model expects MLMultiArray input, shape: \(multiArrayConstraint.shape)")
-            // Model expects tensor input - convert pixel buffer to MLMultiArray
-            let modelShape = multiArrayConstraint.shape.map { $0.intValue }
-
-            // Extract expected dimensions from model shape
-            // Common shapes: [1, 3, H, W] or [3, H, W] or [1, H, W, 3]
-            let expectedHeight: Int
-            let expectedWidth: Int
-
-            if modelShape.count == 4 {
-                // [batch, channels, height, width] or [batch, height, width, channels]
-                if modelShape[1] == 3 {
-                    // [1, 3, H, W] - channels first
-                    expectedHeight = modelShape[2]
-                    expectedWidth = modelShape[3]
-                } else {
-                    // [1, H, W, 3] - channels last
-                    expectedHeight = modelShape[1]
-                    expectedWidth = modelShape[2]
-                }
-            } else if modelShape.count == 3 {
-                // [3, H, W] or [H, W, 3]
-                if modelShape[0] == 3 {
-                    expectedHeight = modelShape[1]
-                    expectedWidth = modelShape[2]
-                } else {
-                    expectedHeight = modelShape[0]
-                    expectedWidth = modelShape[1]
-                }
-            } else {
-                throw VideoPassthroughError.invalidModel
-            }
-
-            let inputWidth = CVPixelBufferGetWidth(pixelBuffer)
-            let inputHeight = CVPixelBufferGetHeight(pixelBuffer)
-
-            // Resize pixel buffer if needed
-            let resizedBuffer: CVPixelBuffer
-            if inputWidth != expectedWidth || inputHeight != expectedHeight {
-                resizedBuffer = try resizePixelBuffer(pixelBuffer, width: expectedWidth, height: expectedHeight)
-            } else {
-                resizedBuffer = pixelBuffer
-            }
-
-            // Create MLMultiArray with the model's expected shape
-            let multiArray = try MLMultiArray(shape: multiArrayConstraint.shape, dataType: .float32)
-
-            // Fast conversion using vImage
-            try convertPixelBufferToMultiArray(resizedBuffer, multiArray: multiArray, width: expectedWidth, height: expectedHeight)
-
-            inputFeature = MLFeatureValue(multiArray: multiArray)
+        // Resize pixel buffer if needed (using cached expected dimensions)
+        let resizedBuffer: CVPixelBuffer
+        if inputWidth != expectedWidth || inputHeight != expectedHeight {
+            resizedBuffer = try resizePixelBuffer(pixelBuffer, width: expectedWidth, height: expectedHeight)
         } else {
-            // Model expects image input directly
-            print("🔍 Model expects image input directly")
-            inputFeature = MLFeatureValue(pixelBuffer: pixelBuffer)
+            resizedBuffer = pixelBuffer
         }
 
+        // Reuse or create input MLMultiArray (using cached input metadata)
+        let multiArray: MLMultiArray
+        let inputShape: [NSNumber] = [1, 3, NSNumber(value: expectedHeight), NSNumber(value: expectedWidth)]
+
+        // Validate cached array dimensions match current model
+        let canReuseCache: Bool
+        if let cached = cachedInputArray {
+            canReuseCache = cached.shape.count >= 4 &&
+                           cached.shape[2].intValue == expectedHeight &&
+                           cached.shape[3].intValue == expectedWidth
+        } else {
+            canReuseCache = false
+        }
+
+        if canReuseCache, let cached = cachedInputArray {
+            multiArray = cached
+        } else {
+            let newArray = try MLMultiArray(shape: inputShape, dataType: .float32)
+            cachedInputArray = newArray
+            multiArray = newArray
+        }
+
+        // Fast GPU conversion using Metal
+        try convertPixelBufferToMultiArray(resizedBuffer, multiArray: multiArray, width: expectedWidth, height: expectedHeight)
+
+        // Create input feature and run prediction (using cached input name)
+        let inputFeature = MLFeatureValue(multiArray: multiArray)
         let inputProvider = try MLDictionaryFeatureProvider(dictionary: [inputName: inputFeature])
 
         // Run prediction
         let output = try await styleModel.prediction(from: inputProvider)
 
-        // Extract output
-        guard let outputName = styleModel.modelDescription.outputDescriptionsByName.keys.first,
-              let outputFeature = output.featureValue(for: outputName) else {
+        // Extract output (using cached output name)
+        guard let outputFeature = output.featureValue(for: outputName),
+              let outputMultiArray = outputFeature.multiArrayValue else {
             throw VideoPassthroughError.predictionFailed
         }
 
-        // Check if output is multiArray or image
-        let styledBuffer: CVPixelBuffer
-        if let multiArray = outputFeature.multiArrayValue {
-            // Convert multiArray back to CVPixelBuffer
-            styledBuffer = try convertMultiArrayToPixelBuffer(multiArray)
-        } else if let outputBuffer = outputFeature.imageBufferValue {
-            // Output is already a pixel buffer
-            styledBuffer = outputBuffer
-        } else {
-            throw VideoPassthroughError.predictionFailed
-        }
+        // Convert output back to CVPixelBuffer
+        let styledBuffer = try convertMultiArrayToPixelBuffer(outputMultiArray)
 
         // Resize output back to original dimensions if needed
         let outputWidth = CVPixelBufferGetWidth(styledBuffer)
         let outputHeight = CVPixelBufferGetHeight(styledBuffer)
 
-        if outputWidth != originalWidth || outputHeight != originalHeight {
-            return try resizePixelBuffer(styledBuffer, width: originalWidth, height: originalHeight)
+        if outputWidth != inputWidth || outputHeight != inputHeight {
+            return try resizePixelBuffer(styledBuffer, width: inputWidth, height: inputHeight)
         } else {
             return styledBuffer
         }
@@ -315,22 +405,21 @@ final class VideoPassthroughSimulator: NSObject {
         computeEncoder.setComputePipelineState(bgraToTensorPipeline)
         computeEncoder.setTexture(texture, index: 0)
 
-        // Get pointer to MLMultiArray data and create Metal buffer
+        // Reuse or create Metal buffer
         let bufferSize = width * height * 3 * MemoryLayout<Float>.stride
 
-        print("🔍 Creating Metal buffer: size=\(bufferSize), width=\(width), height=\(height)")
-
-        // Create a new buffer instead of using bytesNoCopy for better simulator compatibility
-        guard let outputBuffer = metalDevice.makeBuffer(
-            length: bufferSize,
-            options: .storageModeShared
-        ) else {
-            print("❌ Failed to create Metal buffer (size: \(bufferSize) bytes)")
-            computeEncoder.endEncoding()
-            throw VideoPassthroughError.predictionFailed
+        let outputBuffer: MTLBuffer
+        if let cached = cachedInputBuffer, cached.length >= bufferSize {
+            outputBuffer = cached
+        } else {
+            guard let newBuffer = metalDevice.makeBuffer(length: bufferSize, options: .storageModeShared) else {
+                print("❌ Failed to create Metal buffer (size: \(bufferSize) bytes)")
+                computeEncoder.endEncoding()
+                throw VideoPassthroughError.predictionFailed
+            }
+            cachedInputBuffer = newBuffer
+            outputBuffer = newBuffer
         }
-
-        print("✅ Metal buffer created successfully")
 
         var widthParam = UInt32(width)
         var heightParam = UInt32(height)
@@ -339,7 +428,7 @@ final class VideoPassthroughSimulator: NSObject {
         computeEncoder.setBytes(&widthParam, length: MemoryLayout<UInt32>.stride, index: 1)
         computeEncoder.setBytes(&heightParam, length: MemoryLayout<UInt32>.stride, index: 2)
 
-        // Dispatch threads
+        // Dispatch threads with optimized thread group size
         let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
         let threadGroups = MTLSize(
             width: (width + threadGroupSize.width - 1) / threadGroupSize.width,
@@ -353,10 +442,21 @@ final class VideoPassthroughSimulator: NSObject {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        // Copy data from Metal buffer to MLMultiArray
-        let arrayPointer = multiArray.dataPointer.assumingMemoryBound(to: Float.self)
+        // Copy data from Metal buffer to MLMultiArray using safe subscript access
+        let arrayDataSize = multiArray.count * MemoryLayout<Float>.stride
+
+        guard arrayDataSize >= bufferSize else {
+            print("❌ MLMultiArray size (\(arrayDataSize)) is smaller than expected (\(bufferSize))")
+            computeEncoder.endEncoding()
+            throw VideoPassthroughError.predictionFailed
+        }
+
         let bufferPointer = outputBuffer.contents().assumingMemoryBound(to: Float.self)
-        memcpy(arrayPointer, bufferPointer, bufferSize)
+
+        // Use fast memcpy with correct size
+        let arrayPointer = multiArray.dataPointer.assumingMemoryBound(to: Float.self)
+        let copySize = min(arrayDataSize, bufferSize)
+        memcpy(arrayPointer, bufferPointer, copySize)
     }
 
     private func resizePixelBuffer(_ pixelBuffer: CVPixelBuffer, width: Int, height: Int) throws -> CVPixelBuffer {
@@ -407,6 +507,22 @@ final class VideoPassthroughSimulator: NSObject {
             height = shape[1]
             width = shape[2]
         } else {
+            print("❌ Unexpected shape count: \(shape.count)")
+            throw VideoPassthroughError.predictionFailed
+        }
+
+        // Validate that shape matches expected channel count
+        let expectedChannels = 3
+        let actualChannels = shape.count == 4 ? shape[1] : shape[0]
+        guard actualChannels == expectedChannels else {
+            print("❌ Expected \(expectedChannels) channels, got \(actualChannels)")
+            throw VideoPassthroughError.predictionFailed
+        }
+
+        // Calculate expected element count
+        let expectedCount = width * height * expectedChannels
+        guard multiArray.count >= expectedCount else {
+            print("❌ MLMultiArray count (\(multiArray.count)) is less than expected (\(expectedCount))")
             throw VideoPassthroughError.predictionFailed
         }
 
@@ -426,41 +542,80 @@ final class VideoPassthroughSimulator: NSObject {
         )
 
         guard status == kCVReturnSuccess, let outputBuffer = pixelBuffer else {
+            print("❌ Failed to create output pixel buffer")
             throw VideoPassthroughError.predictionFailed
         }
 
         // Create Metal texture from pixel buffer (before command buffer)
         guard let texture = createMetalTexture(from: outputBuffer, writable: true) else {
+            print("❌ Failed to create Metal texture")
             throw VideoPassthroughError.predictionFailed
         }
 
         guard let commandBuffer = metalCommandQueue.makeCommandBuffer() else {
+            print("❌ Failed to create command buffer")
             throw VideoPassthroughError.predictionFailed
         }
 
         guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            print("❌ Failed to create compute encoder")
             throw VideoPassthroughError.predictionFailed
         }
 
         // Set up compute pipeline
         computeEncoder.setComputePipelineState(tensorToBGRAPipeline)
 
-        // Get pointer to MLMultiArray data and create Metal buffer
-        let arrayPointer = multiArray.dataPointer.assumingMemoryBound(to: Float.self)
-        let bufferSize = width * height * 3 * MemoryLayout<Float>.stride
+        // Calculate buffer size based on what we actually need
+        let bufferSize = expectedCount * MemoryLayout<Float>.stride
 
-        // Create a new buffer and copy data for better simulator compatibility
-        guard let inputBuffer = metalDevice.makeBuffer(
-            length: bufferSize,
-            options: .storageModeShared
-        ) else {
+        // Reuse or create Metal buffer for output conversion
+        let inputBuffer: MTLBuffer
+        if let cached = cachedOutputBuffer, cached.length >= bufferSize {
+            inputBuffer = cached
+        } else {
+            guard let newBuffer = metalDevice.makeBuffer(length: bufferSize, options: .storageModeShared) else {
+                print("❌ Failed to create Metal buffer")
+                computeEncoder.endEncoding()
+                throw VideoPassthroughError.predictionFailed
+            }
+            cachedOutputBuffer = newBuffer
+            inputBuffer = newBuffer
+        }
+
+        // Copy data from MLMultiArray to Metal buffer using safe subscript access
+        do {
+            let bufferPointer = inputBuffer.contents().assumingMemoryBound(to: Float.self)
+            let arrayDataSize = multiArray.count * MemoryLayout<Float>.stride
+
+            guard arrayDataSize >= bufferSize else {
+                print("❌ MLMultiArray size (\(arrayDataSize)) is smaller than buffer size (\(bufferSize))")
+                computeEncoder.endEncoding()
+                throw VideoPassthroughError.predictionFailed
+            }
+
+            let elementCount = multiArray.count
+
+            // Handle Float16 vs Float32 output based on cached dataType
+            if outputDataType == .float16 {
+                // Output is Float16 - need to convert to Float32
+                let arrayPointer = multiArray.dataPointer.assumingMemoryBound(to: Float16.self)
+
+                // Convert Float16 to Float32
+                for i in 0..<elementCount {
+                    bufferPointer[i] = Float(arrayPointer[i])
+                }
+            } else {
+                // Output is Float32 - direct memcpy
+                let arrayPointer = multiArray.dataPointer.assumingMemoryBound(to: Float.self)
+                let copySize = min(arrayDataSize, bufferSize)
+                memcpy(bufferPointer, arrayPointer, copySize)
+            }
+
+        } catch {
+            print("❌ Error during memory copy: \(error)")
             computeEncoder.endEncoding()
             throw VideoPassthroughError.predictionFailed
         }
-
-        // Copy data from MLMultiArray to Metal buffer
-        let bufferPointer = inputBuffer.contents().assumingMemoryBound(to: Float.self)
-        memcpy(bufferPointer, arrayPointer, bufferSize)
 
         var widthParam = UInt32(width)
         var heightParam = UInt32(height)
@@ -470,7 +625,7 @@ final class VideoPassthroughSimulator: NSObject {
         computeEncoder.setBytes(&widthParam, length: MemoryLayout<UInt32>.stride, index: 1)
         computeEncoder.setBytes(&heightParam, length: MemoryLayout<UInt32>.stride, index: 2)
 
-        // Dispatch threads
+        // Dispatch threads with optimized thread group size
         let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
         let threadGroups = MTLSize(
             width: (width + threadGroupSize.width - 1) / threadGroupSize.width,
@@ -543,11 +698,11 @@ extension VideoPassthroughSimulator {
 
         do {
             let config = MLModelConfiguration()
-            // Use CPU and GPU on simulator, all units on device
             #if targetEnvironment(simulator)
-            config.computeUnits = .cpuAndGPU
+            config.computeUnits = .cpuOnly
             #else
             config.computeUnits = .all
+            config.allowLowPrecisionAccumulationOnGPU = true
             #endif
             let model = try MLModel(contentsOf: modelURL, configuration: config)
 
